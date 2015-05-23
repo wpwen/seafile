@@ -61,6 +61,10 @@ struct _HttpServerState {
     gboolean folder_perms_not_supported;
     gint64 last_check_perms_time;
     gboolean checking_folder_perms;
+
+    gboolean locked_files_not_supported;
+    gint64 last_check_locked_files_time;
+    gboolean checking_locked_files;
 };
 typedef struct _HttpServerState HttpServerState;
 
@@ -2439,8 +2443,13 @@ check_folder_perms_done (HttpFolderPerms *result, void *user_data)
         return;
     }
 
+    SyncInfo *info;
     for (ptr = result->results; ptr; ptr = ptr->next) {
         res = ptr->data;
+
+        info = get_sync_info (seaf->sync_mgr, res->repo_id);
+        if (info->in_sync)
+            continue;
 
         seaf_repo_manager_update_folder_perms (seaf->repo_mgr, res->repo_id,
                                                FOLDER_PERM_TYPE_USER,
@@ -2452,6 +2461,7 @@ check_folder_perms_done (HttpFolderPerms *result, void *user_data)
                                                         res->repo_id,
                                                         res->timestamp);
     }
+
     server_state->last_check_perms_time = now;
 }
 
@@ -2536,7 +2546,140 @@ check_folder_permissions (SeafSyncManager *mgr, GList *repos)
     }
 }
 
-#if 0
+static void
+check_locked_files_done (HttpLockedFiles *result, void *user_data)
+{
+    HttpServerState *server_state = user_data;
+    GList *ptr;
+    HttpLockedFilesRes *locked_res;
+    gint64 now = (gint64)time(NULL);
+
+    server_state->checking_locked_files = FALSE;
+
+    if (!result->success) {
+        /* If on star-up we find that checking locked files fails,
+         * we assume the server doesn't support it.
+         */
+        if (server_state->last_check_locked_files_time == 0)
+            server_state->locked_files_not_supported = TRUE;
+        server_state->last_check_locked_files_time = now;
+        return;
+    }
+
+    SyncInfo *info;
+    GList *p;
+    GHashTable *new_locks;
+    char *file, *key;
+    for (ptr = result->results; ptr; ptr = ptr->next) {
+        locked_res = ptr->data;
+
+        info = get_sync_info (seaf->sync_mgr, locked_res->repo_id);
+        if (info->in_sync)
+            continue;
+
+        new_locks = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+        for (p = locked_res->locked_files; p; p = p->next) {
+            file = p->data;
+            key = g_strdup(file);
+            g_hash_table_replace (new_locks, key, key);
+        }
+
+        seaf_filelock_manager_update (seaf->filelock_mgr,
+                                      locked_res->repo_id,
+                                      new_locks);
+
+        g_hash_table_destroy (new_locks);
+
+        seaf_filelock_manager_update_timestamp (seaf->filelock_mgr,
+                                                locked_res->repo_id,
+                                                locked_res->timestamp);
+    }
+
+    server_state->last_check_locked_files_time = now;
+}
+
+static void
+check_locked_files_one_server (SeafSyncManager *mgr,
+                                     const char *host,
+                                     HttpServerState *server_state,
+                                     GList *repos)
+{
+    GList *ptr;
+    SeafRepo *repo;
+    char *token;
+    gint64 timestamp;
+    HttpLockedFilesReq *req;
+    GList *requests = NULL;
+
+    gint64 now = (gint64)time(NULL);
+
+    if (server_state->http_version == 0 ||
+        server_state->locked_files_not_supported ||
+        server_state->checking_locked_files)
+        return;
+
+    if (server_state->last_check_locked_files_time > 0 &&
+        now - server_state->last_check_locked_files_time < CHECK_FOLDER_PERMS_INTERVAL)
+        return;
+
+    for (ptr = repos; ptr; ptr = ptr->next) {
+        repo = ptr->data;
+
+        if (!repo->head)
+            continue;
+
+        if (g_strcmp0 (host, repo->server_url) != 0)
+            continue;
+
+        token = seaf_repo_manager_get_repo_property (seaf->repo_mgr,
+                                                     repo->id, REPO_PROP_TOKEN);
+        if (!token)
+            continue;
+
+        timestamp = seaf_filelock_manager_get_timestamp (seaf->filelock_mgr,
+                                                         repo->id);
+        if (timestamp < 0)
+            timestamp = 0;
+
+        req = g_new0 (HttpLockedFilesReq, 1);
+        memcpy (req->repo_id, repo->id, 36);
+        req->token = g_strdup(token);
+        req->timestamp = timestamp;
+
+        requests = g_list_append (requests, req);
+    }
+
+    if (!requests)
+        return;
+
+    server_state->checking_locked_files = TRUE;
+
+    /* The requests list will be freed in http tx manager. */
+    http_tx_manager_get_locked_files (seaf->http_tx_mgr,
+                                      server_state->effective_host,
+                                      server_state->use_fileserver_port,
+                                      requests,
+                                      check_locked_files_done,
+                                      server_state);
+}
+
+static void
+check_server_locked_files (SeafSyncManager *mgr, GList *repos)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+    char *host;
+    HttpServerState *state;
+
+    g_hash_table_iter_init (&iter, mgr->http_server_states);
+    while (g_hash_table_iter_next (&iter, &key, &value)) {
+        host = key;
+        state = value;
+        check_locked_files_one_server (mgr, host, state, repos);
+    }
+}
+
 static void
 print_active_paths (SeafSyncManager *mgr)
 {
@@ -2548,7 +2691,6 @@ print_active_paths (SeafSyncManager *mgr)
         g_free (paths_json);
     }
 }
-#endif
 
 static int
 auto_sync_pulse (void *vmanager)
@@ -2558,9 +2700,13 @@ auto_sync_pulse (void *vmanager)
     SeafRepo *repo;
     gint64 now;
 
+    print_active_paths (manager);
+
     repos = seaf_repo_manager_get_repo_list (manager->seaf->repo_mgr, -1, -1);
 
     check_folder_permissions (manager, repos);
+
+    check_server_locked_files (manager, repos);
 
     /* Sort repos by last_sync_time, so that we don't "starve" any repo. */
     repos = g_list_sort_with_data (repos, cmp_repos_by_sync_time, NULL);

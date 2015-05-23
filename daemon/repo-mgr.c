@@ -926,11 +926,14 @@ add_file (const char *repo_id,
 {
     gboolean added = FALSE;
     int ret = 0;
-    gboolean is_writable = TRUE;
+    gboolean is_writable = TRUE, is_locked = FALSE;
 
     if (options)
         is_writable = is_path_writable(options->user_perms, options->group_perms,
                                        options->is_repo_ro, path);
+
+    is_locked = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                                      repo_id, path);
 
     if (options && options->startup_scan) {
         struct cache_entry *ce;
@@ -944,7 +947,7 @@ add_file (const char *repo_id,
             status = SYNC_STATUS_SYNCED;
 
         /* Don't set "syncing" status for read-only path. */
-        if (status == SYNC_STATUS_SYNCED || is_writable)
+        if (status == SYNC_STATUS_SYNCED || (is_writable && !is_locked))
             seaf_sync_manager_update_active_path (seaf->sync_mgr,
                                                   repo_id,
                                                   path,
@@ -952,7 +955,7 @@ add_file (const char *repo_id,
                                                   status);
     }
 
-    if (!is_writable)
+    if (!is_writable || is_locked)
         return ret;
 
 #ifdef WIN32
@@ -2559,8 +2562,11 @@ process_active_path (SeafRepo *repo, const char *path,
         ignored = TRUE;
 
     if (S_ISREG(st.st_mode)) {
-        update_active_file (repo, path, &st, istate, ignored,
-                            user_perms, group_perms);
+        if (!seaf_filelock_manager_is_file_locked(seaf->filelock_mgr,
+                                                  repo->id, path)) {
+            update_active_file (repo, path, &st, istate, ignored,
+                                user_perms, group_perms);
+        }
     } else {
         update_active_path_recursive (repo, path, istate, ignore_list, ignored,
                                       user_perms, group_perms);
@@ -3771,6 +3777,14 @@ checkout_file (const char *repo_id,
         }
     }
 
+    /* Temporarily unlock the file if it's locked on server, so that the client
+     * itself can write to it. 
+     */
+    if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                              repo_id, name))
+        seaf_filelock_manager_unlock_wt_file (seaf->filelock_mgr,
+                                              repo_id, name);
+
     /* then checkout the file. */
     gboolean conflicted = FALSE;
     if (seaf_fs_manager_checkout_file (seaf->fs_mgr,
@@ -3788,8 +3802,19 @@ checkout_file (const char *repo_id,
                                        is_http ? http_task->email : task->email) < 0) {
         seaf_warning ("Failed to checkout file %s.\n", path);
         g_free (path);
+
+        if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                                  repo_id, name))
+            seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
+                                                repo_id, name);
+
         return FETCH_CHECKOUT_FAILED;
     }
+
+    if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                              repo_id, name))
+        seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
+                                            repo_id, name);
 
     /* If case conflict, this file has been checked out to another path.
      * Remove the current entry, otherwise it won't be removed later
@@ -4493,6 +4518,10 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
                         SyncStatus status;
                         if (rc == FETCH_CHECKOUT_FAILED)
                             status = SYNC_STATUS_ERROR;
+                        else if (seaf_filelock_manager_is_file_locked(seaf->filelock_mgr,
+                                                                      repo_id,
+                                                                      de->name))
+                            status = SYNC_STATUS_LOCKED;
                         else
                             status = SYNC_STATUS_SYNCED;
                         seaf_sync_manager_update_active_path (seaf->sync_mgr,
